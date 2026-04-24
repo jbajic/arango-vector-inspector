@@ -92,6 +92,65 @@ impl<'a> Slice<'a> {
     pub fn array_iter(&self) -> Result<ArrayIter<'a>> {
         ArrayIter::new(self.bytes)
     }
+
+    pub fn to_json(&self) -> String {
+        to_json_val(self.bytes)
+    }
+}
+
+// ---- JSON rendering (debug) ----------------------------------------------
+
+fn to_json_val(b: &[u8]) -> String {
+    if b.is_empty() {
+        return "null".into();
+    }
+    let s = Slice::new(b);
+    if s.is_object() {
+        let pairs: Vec<String> = s
+            .object_iter()
+            .map(|iter| {
+                iter.map(|(k, v)| {
+                    let key = k
+                        .as_str()
+                        .map(|s| format!("\"{}\"", s))
+                        .unwrap_or_else(|| "\"?\"".into());
+                    format!("{}:{}", key, to_json_val(v.raw()))
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+        return format!("{{{}}}", pairs.join(","));
+    }
+    if s.is_array() {
+        let items: Vec<String> = s
+            .array_iter()
+            .map(|iter| iter.map(|v| to_json_val(v.raw())).collect())
+            .unwrap_or_default();
+        return format!("[{}]", items.join(","));
+    }
+    if s.is_string() {
+        return s
+            .as_str()
+            .map(|x| format!("\"{}\"", x))
+            .unwrap_or_else(|| "\"?\"".into());
+    }
+    if let Some(n) = s.as_u64() {
+        return n.to_string();
+    }
+    match b[0] {
+        0x19 => "false".into(),
+        0x1a => "true".into(),
+        0x18 => "null".into(),
+        0x1b => {
+            let f = f64::from_le_bytes(
+                b.get(1..9)
+                    .and_then(|x| x.try_into().ok())
+                    .unwrap_or([0; 8]),
+            );
+            f.to_string()
+        }
+        t => format!("\"<0x{:02x}>\"", t),
+    }
 }
 
 // ---- length calculation --------------------------------------------------

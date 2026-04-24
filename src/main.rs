@@ -92,9 +92,8 @@ fn print_json(args: &Args, r: &ScanResult) -> Result<()> {
 fn to_json_index(oid: u64, s: &PerIndexStats, meta: Option<&IndexMeta>) -> JsonIndex {
     let counts = centroid_counts(s, meta);
     let dist = distribution(&counts);
-    let empty = meta
-        .and_then(|m| m.n_lists)
-        .map(|n| n.saturating_sub(s.non_empty_lists()));
+    let n_lists = resolved_n_lists(s, meta);
+    let empty = n_lists.map(|n| n.saturating_sub(s.non_empty_lists()));
     JsonIndex {
         object_id: oid,
         object_id_hex: format!("0x{:016x}", oid),
@@ -103,7 +102,7 @@ fn to_json_index(oid: u64, s: &PerIndexStats, meta: Option<&IndexMeta>) -> JsonI
         database_id: meta.map(|m| m.database_id),
         dimension: meta.and_then(|m| m.dimension),
         metric: meta.and_then(|m| m.metric.clone()),
-        configured_n_lists: meta.and_then(|m| m.n_lists),
+        configured_n_lists: n_lists,
         trained: s.trained,
         total_vectors: s.total_vectors(),
         non_empty_centroids: s.non_empty_lists(),
@@ -152,7 +151,7 @@ fn print_index(oid: u64, s: &PerIndexStats, meta: Option<&IndexMeta>) {
         if let Some(ref met) = m.metric {
             println!("  metric:             {}", met);
         }
-        if let Some(n) = m.n_lists {
+        if let Some(n) = m.n_lists.as_ref().map(|p| p.resolve(s.total_vectors())) {
             println!("  configured nLists:  {}", n);
         }
     }
@@ -165,7 +164,7 @@ fn print_index(oid: u64, s: &PerIndexStats, meta: Option<&IndexMeta>) {
     if let Some(max_list) = s.max_list_number() {
         println!("  max list# observed: {}", max_list);
     }
-    if let Some(n) = meta.and_then(|m| m.n_lists) {
+    if let Some(n) = resolved_n_lists(s, meta) {
         let empty = n.saturating_sub(s.non_empty_lists());
         println!("  empty centroids:    {} of {}", empty, n);
     } else {
@@ -179,7 +178,7 @@ fn print_index(oid: u64, s: &PerIndexStats, meta: Option<&IndexMeta>) {
     println!();
     println!(
         "  Distribution (vectors per centroid{}):",
-        if meta.and_then(|m| m.n_lists).is_some() {
+        if resolved_n_lists(s, meta).is_some() {
             ", including empties"
         } else {
             ", populated only"
@@ -222,11 +221,15 @@ fn filtered<'a>(
         .map(move |oid| (oid, &r.indexes[&oid]))
 }
 
+fn resolved_n_lists(s: &PerIndexStats, meta: Option<&IndexMeta>) -> Option<u64> {
+    meta?.n_lists.as_ref().map(|p| p.resolve(s.total_vectors()))
+}
+
 /// Build the per-centroid count vector. If we know the configured nLists we
 /// fill in zeros for empty lists so distribution stats include them; otherwise
 /// we only report populated lists.
 fn centroid_counts(s: &PerIndexStats, meta: Option<&IndexMeta>) -> Vec<u64> {
-    if let Some(n) = meta.and_then(|m| m.n_lists) {
+    if let Some(n) = resolved_n_lists(s, meta) {
         let mut v = vec![0u64; n as usize];
         for (&list, &count) in &s.lists {
             if (list as usize) < v.len() {

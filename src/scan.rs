@@ -32,6 +32,46 @@ impl PerIndexStats {
     }
 }
 
+/// NLists parameter — either a fixed count or a tiered-sqrt scaling spec.
+/// Mirrors `NListsParameter` in ArangoDB's VectorIndexDefinition.h.
+#[derive(Debug, Clone)]
+pub enum NListsParam {
+    Fixed(u64),
+    /// autoSqrt: nLists = max(min_n_lists, multiplier * sqrt(doc_count)),
+    /// unless doc_count exceeds a tier threshold, in which case the highest
+    /// matching tier's fixedValue is used.
+    AutoSqrt {
+        multiplier: f64,
+        min_n_lists: u64,
+        /// (threshold, fixed_value) pairs, sorted ascending by threshold
+        tiers: Vec<(u64, u64)>,
+    },
+}
+
+impl NListsParam {
+    pub fn resolve(&self, doc_count: u64) -> u64 {
+        match self {
+            NListsParam::Fixed(n) => *n,
+            NListsParam::AutoSqrt {
+                multiplier,
+                min_n_lists,
+                tiers,
+            } => {
+                // Use highest-threshold tier that is <= doc_count.
+                let tier = tiers
+                    .iter()
+                    .filter(|(t, _)| *t <= doc_count)
+                    .max_by_key(|(t, _)| *t);
+                if let Some((_, fixed)) = tier {
+                    return *fixed;
+                }
+                let computed = (*multiplier * (doc_count as f64).sqrt()) as u64;
+                computed.max(*min_n_lists)
+            }
+        }
+    }
+}
+
 /// Index metadata recovered from the definitions CF.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -42,8 +82,7 @@ pub struct IndexMeta {
     pub database_id: u64,
     pub dimension: Option<u64>,
     pub metric: Option<String>,
-    /// Fixed nLists if stored as a plain integer. None if scaling spec or absent.
-    pub n_lists: Option<u64>,
+    pub n_lists: Option<NListsParam>,
 }
 
 pub struct ScanResult {
@@ -78,8 +117,8 @@ fn make_cf_descriptors(cf_names: &[String]) -> Vec<ColumnFamilyDescriptor> {
 fn open_db(db_path: &str, cf_names: &[String]) -> Result<DB> {
     let journals = Path::new(db_path).join("journals");
     if journals.exists() {
-        let secondary_path = tempfile::tempdir()
-            .context("failed to create temp dir for secondary instance")?;
+        let secondary_path =
+            tempfile::tempdir().context("failed to create temp dir for secondary instance")?;
         let mut db_opts = Options::default();
         db_opts.create_if_missing(false);
         db_opts.set_wal_dir(&journals);
@@ -223,7 +262,7 @@ fn scan_definitions_cf(db: &DB) -> Result<HashMap<u64, IndexMeta>> {
                 .get("metric")
                 .and_then(|s| s.as_str())
                 .map(|s| s.to_string());
-            let n_lists = params.get("nLists").and_then(|s| s.as_u64());
+            let n_lists = params.get("nLists").and_then(parse_n_lists_param);
 
             out.insert(
                 object_id,
@@ -240,4 +279,32 @@ fn scan_definitions_cf(db: &DB) -> Result<HashMap<u64, IndexMeta>> {
         }
     }
     Ok(out)
+}
+
+fn parse_n_lists_param(s: Slice<'_>) -> Option<NListsParam> {
+    if let Some(n) = s.as_u64() {
+        return Some(NListsParam::Fixed(n));
+    }
+    if s.is_object() {
+        let multiplier = s.get("multiplier").and_then(|v| v.as_u64()).unwrap_or(4) as f64;
+        let min_n_lists = s.get("minNLists").and_then(|v| v.as_u64()).unwrap_or(2);
+        let tiers = s
+            .get("tiers")
+            .and_then(|arr| arr.array_iter().ok())
+            .map(|iter| {
+                iter.filter_map(|tier| {
+                    let threshold = tier.get("threshold")?.as_u64()?;
+                    let fixed = tier.get("fixedValue")?.as_u64()?;
+                    Some((threshold, fixed))
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+        return Some(NListsParam::AutoSqrt {
+            multiplier,
+            min_n_lists,
+            tiers,
+        });
+    }
+    None
 }
