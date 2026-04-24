@@ -4,6 +4,7 @@
 use anyhow::{Context, Result, anyhow};
 use rocksdb::{ColumnFamilyDescriptor, DB, IteratorMode, Options};
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 
 use crate::vpack::Slice;
 
@@ -52,20 +53,62 @@ pub struct ScanResult {
     pub anomalies: u64,
 }
 
-pub fn scan(db_path: &str) -> Result<ScanResult> {
-    let cf_names = DB::list_cf(&Options::default(), db_path)
-        .with_context(|| format!("list_cf on {}", db_path))?;
-    let descriptors: Vec<ColumnFamilyDescriptor> = cf_names
+/// CFs that ArangoDB opens with RocksDBVPackComparator (name must match).
+/// We never iterate them, so bytewise ordering is fine for read-only access.
+const VPACK_COMPARATOR_CFS: &[&str] = &["VPackIndex", "MdiPrefixed"];
+
+fn make_cf_descriptors(cf_names: &[String]) -> Vec<ColumnFamilyDescriptor> {
+    cf_names
         .iter()
-        .map(|n| ColumnFamilyDescriptor::new(n, Options::default()))
-        .collect();
+        .map(|n| {
+            let mut opts = Options::default();
+            if VPACK_COMPARATOR_CFS.contains(&n.as_str()) {
+                opts.set_comparator("RocksDBVPackComparator", Box::new(|a, b| a.cmp(b)));
+            }
+            ColumnFamilyDescriptor::new(n, opts)
+        })
+        .collect()
+}
+
+/// Opens the RocksDB instance. ArangoDB stores its WAL in a `journals/`
+/// subdirectory, so if that directory exists we open as a secondary instance
+/// (which tails the WAL) rather than plain read-only (which only sees flushed
+/// SST files). A temp directory is used for the secondary's own metadata and
+/// is cleaned up on drop.
+fn open_db(db_path: &str, cf_names: &[String]) -> Result<DB> {
+    let journals = Path::new(db_path).join("journals");
+    if journals.exists() {
+        let secondary_path = tempfile::tempdir()
+            .context("failed to create temp dir for secondary instance")?;
+        let mut db_opts = Options::default();
+        db_opts.create_if_missing(false);
+        db_opts.set_wal_dir(&journals);
+        let db = DB::open_cf_descriptors_as_secondary(
+            &db_opts,
+            db_path,
+            secondary_path.path().to_str().unwrap(),
+            make_cf_descriptors(cf_names),
+        )
+        .with_context(|| format!("open_cf_descriptors_as_secondary on {}", db_path))?;
+        db.try_catch_up_with_primary()
+            .context("try_catch_up_with_primary failed")?;
+        // Keep tempdir alive until DB is dropped by leaking it; the OS will
+        // clean it up when the process exits.
+        std::mem::forget(secondary_path);
+        return Ok(db);
+    }
 
     let mut db_opts = Options::default();
     db_opts.create_if_missing(false);
-    // error_if_log_file_exist defaults to false, which is what we want for
-    // opening an existing DB in read-only mode.
-    let db = DB::open_cf_descriptors_read_only(&db_opts, db_path, descriptors, false)
-        .with_context(|| format!("open_cf_descriptors_read_only on {}", db_path))?;
+    DB::open_cf_descriptors_read_only(&db_opts, db_path, make_cf_descriptors(cf_names), false)
+        .with_context(|| format!("open_cf_descriptors_read_only on {}", db_path))
+}
+
+pub fn scan(db_path: &str) -> Result<ScanResult> {
+    let cf_names = DB::list_cf(&Options::default(), db_path)
+        .with_context(|| format!("list_cf on {}", db_path))?;
+
+    let db = open_db(db_path, &cf_names)?;
 
     let indexes = scan_vector_cf(&db)?;
     let mut result = ScanResult {
