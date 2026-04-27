@@ -1,6 +1,8 @@
 mod centroids;
+mod projection;
 mod scan;
 mod stats;
+mod ui;
 mod vpack;
 
 use anyhow::{Context, Result};
@@ -34,6 +36,12 @@ struct Args {
     /// (count, dim, first-row preview, norm range).
     #[arg(long)]
     centroids: bool,
+
+    /// Open a window visualizing the centroids of one index as a 2D Voronoi
+    /// diagram (PCA-projected). If --index-id is unset, the first vector
+    /// index found is shown.
+    #[arg(long)]
+    ui: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -45,6 +53,9 @@ enum Format {
 fn main() -> Result<()> {
     let args = Args::parse();
     let result = scan::scan(&args.db)?;
+    if args.ui {
+        return run_ui(&args, &result);
+    }
     if args.centroids {
         print_centroids_info(&args, &result)?;
     }
@@ -53,6 +64,89 @@ fn main() -> Result<()> {
         Format::Json => print_json(&args, &result)?,
     }
     Ok(())
+}
+
+fn run_ui(args: &Args, r: &ScanResult) -> Result<()> {
+    let (oid, stats) = filtered(args, r)
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no vector indexes found"))?;
+    let value = stats
+        .trained_value
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("index {oid} has no trained data"))?;
+    let bytes =
+        centroids::extract_code_data(value).context("extracting codeData from trained value")?;
+    let c = centroids::read_centroids(&bytes).context("decoding FAISS index")?;
+    let points = projection::pca_2d(&c.vectors).context("PCA projection")?;
+
+    let views: Vec<ui::CentroidView> = points
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| ui::CentroidView {
+            point: p,
+            count: stats.lists.get(&(i as u64)).copied().unwrap_or(0),
+        })
+        .collect();
+
+    let meta = r.metadata.get(&oid);
+    let title = match meta {
+        Some(m) => format!("{}/{}", m.collection_name, m.name),
+        None => format!("objectId {oid}"),
+    };
+    let overview = build_overview_kvs(oid, stats, meta, c.vectors.len(), c.dim);
+
+    ui::run(ui::ViewerData {
+        title,
+        overview,
+        centroids: views,
+    })
+}
+
+fn build_overview_kvs(
+    oid: u64,
+    s: &PerIndexStats,
+    meta: Option<&IndexMeta>,
+    nlist: usize,
+    dim: usize,
+) -> Vec<(String, String)> {
+    let mut kvs = Vec::new();
+    if let Some(m) = meta {
+        kvs.push(("collection".into(), m.collection_name.clone()));
+        kvs.push(("index name".into(), m.name.clone()));
+    }
+    kvs.push(("objectId".into(), format!("{oid}  (0x{oid:016x})")));
+    if let Some(m) = meta {
+        if let Some(d) = m.dimension {
+            kvs.push(("dimension".into(), d.to_string()));
+        }
+        if let Some(met) = &m.metric {
+            kvs.push(("metric".into(), met.clone()));
+        }
+    }
+    kvs.push(("dim (from FAISS)".into(), dim.to_string()));
+    kvs.push(("centroids (nLists)".into(), nlist.to_string()));
+    kvs.push((
+        "trained".into(),
+        if s.trained { "yes" } else { "no" }.to_string(),
+    ));
+    kvs.push(("total vectors".into(), s.total_vectors().to_string()));
+    kvs.push(("non-empty centroids".into(), s.non_empty_lists().to_string()));
+    let empty = (nlist as u64).saturating_sub(s.non_empty_lists());
+    kvs.push(("empty centroids".into(), format!("{empty} of {nlist}")));
+
+    let counts: Vec<u64> = (0..nlist as u64)
+        .map(|i| s.lists.get(&i).copied().unwrap_or(0))
+        .collect();
+    if let Some(dist) = stats::distribution(&counts) {
+        kvs.push(("count min".into(), dist.min.to_string()));
+        kvs.push(("count max".into(), dist.max.to_string()));
+        kvs.push(("count mean".into(), format!("{:.2}", dist.mean)));
+        kvs.push(("count median".into(), dist.median.to_string()));
+        kvs.push(("count p95".into(), dist.p95.to_string()));
+        kvs.push(("count p99".into(), dist.p99.to_string()));
+        kvs.push(("count stddev".into(), format!("{:.2}", dist.stddev)));
+    }
+    kvs
 }
 
 fn print_centroids_info(args: &Args, r: &ScanResult) -> Result<()> {
