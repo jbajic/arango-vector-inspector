@@ -130,7 +130,10 @@ fn build_overview_kvs(
         if s.trained { "yes" } else { "no" }.to_string(),
     ));
     kvs.push(("total vectors".into(), s.total_vectors().to_string()));
-    kvs.push(("non-empty centroids".into(), s.non_empty_lists().to_string()));
+    kvs.push((
+        "non-empty centroids".into(),
+        s.non_empty_lists().to_string(),
+    ));
     let empty = (nlist as u64).saturating_sub(s.non_empty_lists());
     kvs.push(("empty centroids".into(), format!("{empty} of {nlist}")));
 

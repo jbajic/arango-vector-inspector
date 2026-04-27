@@ -12,9 +12,8 @@
 
 use anyhow::{Context, Result, anyhow};
 use faiss_sys::{
-    FaissIndex, faiss_IndexIVF_cast, faiss_IndexIVF_nlist, faiss_IndexIVF_quantizer,
-    faiss_Index_d, faiss_Index_free, faiss_Index_reconstruct, faiss_get_last_error,
-    faiss_read_index_fname,
+    FaissIndex, faiss_Index_d, faiss_Index_free, faiss_Index_reconstruct, faiss_IndexIVF_cast,
+    faiss_IndexIVF_nlist, faiss_IndexIVF_quantizer, faiss_get_last_error, faiss_read_index_fname,
 };
 use std::ffi::{CStr, CString};
 use std::io::Write;
@@ -60,7 +59,9 @@ pub fn read_centroids(faiss_bytes: &[u8]) -> Result<Centroids> {
     let index = OwnedFaissIndex::read(&path_cstr)?;
     let ivf = unsafe { faiss_IndexIVF_cast(index.as_ptr()) };
     if ivf.is_null() {
-        return Err(anyhow!("FAISS index is not an IndexIVF — got something else"));
+        return Err(anyhow!(
+            "FAISS index is not an IndexIVF — got something else"
+        ));
     }
     let nlist = unsafe { faiss_IndexIVF_nlist(ivf) } as usize;
     let dim = unsafe { faiss_Index_d(index.as_ptr()) } as usize;

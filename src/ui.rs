@@ -111,8 +111,7 @@ fn build_cells(centroids: &[CentroidView]) -> (Vec<Vec<egui::Pos2>>, egui::Rect)
         })
         .collect();
 
-    let diagram =
-        VoronoiDiagram::<Point>::new(&lo, &hi, &pts).expect("Voronoi computation failed");
+    let diagram = VoronoiDiagram::<Point>::new(&lo, &hi, &pts).expect("Voronoi computation failed");
 
     // diagram.cells() preserves input order.
     let cells: Vec<Vec<egui::Pos2>> = diagram

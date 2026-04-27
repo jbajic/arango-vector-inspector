@@ -66,7 +66,11 @@ impl<'a> Slice<'a> {
                 if w < 8 && bytes[w - 1] & 0x80 != 0 {
                     return None;
                 }
-                if (0..=255).contains(&v) { Some(v as u8) } else { None }
+                if (0..=255).contains(&v) {
+                    Some(v as u8)
+                } else {
+                    None
+                }
             }
             t @ 0x28..=0x2f => {
                 let w = (t - 0x27) as usize;
