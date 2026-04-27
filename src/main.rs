@@ -78,9 +78,37 @@ fn main() -> Result<()> {
 }
 
 fn run_ui(args: &Args, r: &ScanResult) -> Result<()> {
-    let (oid, stats) = filtered(args, r)
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no vector indexes found"))?;
+    let candidates: Vec<(u64, &PerIndexStats)> = filtered(args, r)
+        .filter(|(_, s)| s.trained_value.is_some())
+        .collect();
+    if candidates.is_empty() {
+        return Err(anyhow::anyhow!("no vector indexes with trained data found"));
+    }
+
+    let mut views: Vec<ui::IndexView> = Vec::with_capacity(candidates.len());
+    for (oid, stats) in candidates {
+        eprintln!(
+            "Loading index {oid}{}...",
+            if matches!(args.projection, Projection::Tsne) {
+                " (t-SNE may take a few seconds)"
+            } else {
+                ""
+            }
+        );
+        let view = build_index_view(oid, stats, r.metadata.get(&oid), args)
+            .with_context(|| format!("preparing index {oid}"))?;
+        views.push(view);
+    }
+
+    ui::run(ui::ViewerData { indexes: views })
+}
+
+fn build_index_view(
+    oid: u64,
+    stats: &PerIndexStats,
+    meta: Option<&IndexMeta>,
+    args: &Args,
+) -> Result<ui::IndexView> {
     let value = stats
         .trained_value
         .as_deref()
@@ -90,13 +118,10 @@ fn run_ui(args: &Args, r: &ScanResult) -> Result<()> {
     let c = centroids::read_centroids(&bytes).context("decoding FAISS index")?;
     let points = match args.projection {
         Projection::Pca => projection::pca_2d(&c.vectors).context("PCA projection")?,
-        Projection::Tsne => {
-            eprintln!("Computing t-SNE projection (may take a few seconds)...");
-            projection::tsne_2d(&c.vectors).context("t-SNE projection")?
-        }
+        Projection::Tsne => projection::tsne_2d(&c.vectors).context("t-SNE projection")?,
     };
 
-    let views: Vec<ui::CentroidView> = points
+    let centroid_views: Vec<ui::CentroidView> = points
         .iter()
         .enumerate()
         .map(|(i, &p)| ui::CentroidView {
@@ -105,17 +130,31 @@ fn run_ui(args: &Args, r: &ScanResult) -> Result<()> {
         })
         .collect();
 
-    let meta = r.metadata.get(&oid);
     let title = match meta {
         Some(m) => format!("{}/{}", m.collection_name, m.name),
         None => format!("objectId {oid}"),
     };
     let overview = build_overview_kvs(oid, stats, meta, c.vectors.len(), c.dim);
 
-    ui::run(ui::ViewerData {
+    let (cells, cell_areas, bbox) = ui::build_cells(&points);
+    let max_count = centroid_views.iter().map(|c| c.count).max().unwrap_or(1);
+    let mut sorted_counts: Vec<(u64, usize)> = centroid_views
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.count, i))
+        .collect();
+    sorted_counts.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+    Ok(ui::IndexView {
         title,
         overview,
-        centroids: views,
+        centroids: centroid_views,
+        high_dim: c.vectors,
+        cells,
+        cell_areas,
+        bbox,
+        max_count,
+        sorted_counts,
     })
 }
 
