@@ -1,8 +1,14 @@
-//! 2D projection of high-dimensional centroids via PCA.
+//! 2D projections of high-dimensional centroids for visualization.
 //!
-//! For visualization only — distances in the 2D plot will be lossy
-//! (especially when intrinsic dimensionality is high), but neighborhood
-//! structure is roughly preserved.
+//! Two methods are provided:
+//!  * `pca_2d` — fast linear projection (top-2 principal components). Tends
+//!    to render data on a hypersphere as a 2D disk, which can look "circly".
+//!  * `tsne_2d` — non-linear t-SNE projection. Slower but breaks the
+//!    spherical-disk artifact and produces a more spread-out, "classical"
+//!    looking layout suitable for Voronoi diagrams.
+//!
+//! Distances in either output are lossy; relative neighborhood structure is
+//! roughly preserved (more so for t-SNE).
 
 use anyhow::{Result, anyhow};
 use nalgebra::DMatrix;
@@ -60,6 +66,53 @@ pub fn pca_2d(centroids: &[Vec<f32>]) -> Result<Vec<Point2>> {
             x: x as f32,
             y: y as f32,
         });
+    }
+    Ok(out)
+}
+
+/// Project to 2D using Barnes-Hut t-SNE. Slow (seconds) but produces a
+/// non-linear layout that doesn't collapse spherical data into a disk.
+///
+/// Perplexity is auto-clamped to fit small inputs (must be < n/3).
+pub fn tsne_2d(centroids: &[Vec<f32>]) -> Result<Vec<Point2>> {
+    let n = centroids.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if n < 4 {
+        // t-SNE needs more points than perplexity; fall back to PCA.
+        return pca_2d(centroids);
+    }
+
+    let perplexity = (n as f32 / 3.0 - 1.0).min(30.0).max(5.0);
+    let samples: Vec<&[f32]> = centroids.iter().map(|v| v.as_slice()).collect();
+
+    let mut tsne: bhtsne::tSNE<f32, &[f32]> = bhtsne::tSNE::new(&samples);
+    tsne.embedding_dim(2)
+        .perplexity(perplexity)
+        .epochs(1000)
+        .barnes_hut(0.5, |a, b| {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y).powi(2))
+                .sum::<f32>()
+                .sqrt()
+        });
+
+    let flat = tsne.embedding();
+    let mut out = Vec::with_capacity(n);
+    for chunk in flat.chunks_exact(2) {
+        out.push(Point2 {
+            x: chunk[0],
+            y: chunk[1],
+        });
+    }
+    if out.len() != n {
+        return Err(anyhow!(
+            "t-SNE returned {} points, expected {}",
+            out.len(),
+            n
+        ));
     }
     Ok(out)
 }

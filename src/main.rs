@@ -38,10 +38,21 @@ struct Args {
     centroids: bool,
 
     /// Open a window visualizing the centroids of one index as a 2D Voronoi
-    /// diagram (PCA-projected). If --index-id is unset, the first vector
-    /// index found is shown.
+    /// diagram. If --index-id is unset, the first vector index found is shown.
     #[arg(long)]
     ui: bool,
+
+    /// Projection method used to embed centroids into 2D for the UI.
+    /// `tsne` is non-linear (slower, prettier); `pca` is fast but tends to
+    /// render spherical centroid clouds as disks.
+    #[arg(long, value_enum, default_value_t = Projection::Tsne)]
+    projection: Projection,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Projection {
+    Pca,
+    Tsne,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -77,7 +88,13 @@ fn run_ui(args: &Args, r: &ScanResult) -> Result<()> {
     let bytes =
         centroids::extract_code_data(value).context("extracting codeData from trained value")?;
     let c = centroids::read_centroids(&bytes).context("decoding FAISS index")?;
-    let points = projection::pca_2d(&c.vectors).context("PCA projection")?;
+    let points = match args.projection {
+        Projection::Pca => projection::pca_2d(&c.vectors).context("PCA projection")?,
+        Projection::Tsne => {
+            eprintln!("Computing t-SNE projection (may take a few seconds)...");
+            projection::tsne_2d(&c.vectors).context("t-SNE projection")?
+        }
+    };
 
     let views: Vec<ui::CentroidView> = points
         .iter()
@@ -130,12 +147,8 @@ fn build_overview_kvs(
         if s.trained { "yes" } else { "no" }.to_string(),
     ));
     kvs.push(("total vectors".into(), s.total_vectors().to_string()));
-    kvs.push((
-        "non-empty centroids".into(),
-        s.non_empty_lists().to_string(),
-    ));
-    let empty = (nlist as u64).saturating_sub(s.non_empty_lists());
-    kvs.push(("empty centroids".into(), format!("{empty} of {nlist}")));
+    let dead = (nlist as u64).saturating_sub(s.non_empty_lists());
+    kvs.push(("dead centroids".into(), format!("{dead} of {nlist}")));
 
     let counts: Vec<u64> = (0..nlist as u64)
         .map(|i| s.lists.get(&i).copied().unwrap_or(0))
@@ -206,7 +219,7 @@ struct JsonIndex {
     total_vectors: u64,
     non_empty_centroids: u64,
     max_list_number_observed: Option<u64>,
-    empty_centroids: Option<u64>,
+    dead_centroids: Option<u64>,
     distribution: Option<Distribution>,
 }
 
@@ -229,7 +242,7 @@ fn to_json_index(oid: u64, s: &PerIndexStats, meta: Option<&IndexMeta>) -> JsonI
     let counts = centroid_counts(s, meta);
     let dist = distribution(&counts);
     let n_lists = resolved_n_lists(s, meta);
-    let empty = n_lists.map(|n| n.saturating_sub(s.non_empty_lists()));
+    let dead = n_lists.map(|n| n.saturating_sub(s.non_empty_lists()));
     JsonIndex {
         object_id: oid,
         object_id_hex: format!("0x{:016x}", oid),
@@ -243,7 +256,7 @@ fn to_json_index(oid: u64, s: &PerIndexStats, meta: Option<&IndexMeta>) -> JsonI
         total_vectors: s.total_vectors(),
         non_empty_centroids: s.non_empty_lists(),
         max_list_number_observed: s.max_list_number(),
-        empty_centroids: empty,
+        dead_centroids: dead,
         distribution: dist,
     }
 }
@@ -301,10 +314,10 @@ fn print_index(oid: u64, s: &PerIndexStats, meta: Option<&IndexMeta>) {
         println!("  max list# observed: {}", max_list);
     }
     if let Some(n) = resolved_n_lists(s, meta) {
-        let empty = n.saturating_sub(s.non_empty_lists());
-        println!("  empty centroids:    {} of {}", empty, n);
+        let dead = n.saturating_sub(s.non_empty_lists());
+        println!("  dead centroids:     {} of {}", dead, n);
     } else {
-        println!("  empty centroids:    (unknown — configured nLists not available)");
+        println!("  dead centroids:     (unknown — configured nLists not available)");
     }
 
     let counts = centroid_counts(s, meta);

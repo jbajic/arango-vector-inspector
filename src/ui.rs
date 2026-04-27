@@ -50,8 +50,8 @@ struct ViewerApp {
     bbox: egui::Rect,
     /// Max count, used for histogram scaling.
     max_count: u64,
-    /// Per-centroid counts sorted descending — used for the histogram tab.
-    sorted_counts: Vec<u64>,
+    /// (count, original_centroid_index) sorted by count descending.
+    sorted_counts: Vec<(u64, usize)>,
     tab: Tab,
 }
 
@@ -59,8 +59,15 @@ impl ViewerApp {
     fn new(data: ViewerData) -> Self {
         let (cells, bbox) = build_cells(&data.centroids);
         let max_count = data.centroids.iter().map(|c| c.count).max().unwrap_or(1);
-        let mut sorted_counts: Vec<u64> = data.centroids.iter().map(|c| c.count).collect();
-        sorted_counts.sort_unstable_by(|a, b| b.cmp(a));
+        let mut sorted_counts: Vec<(u64, usize)> = data
+            .centroids
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.count, i))
+            .collect();
+        // Sort by count descending; break ties by original index ascending so
+        // ordering is stable and reproducible.
+        sorted_counts.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         Self {
             data,
             cells,
@@ -238,24 +245,43 @@ impl ViewerApp {
 
             let avail = ui.available_rect_before_wrap();
             let painter = ui.painter_at(avail);
-            // Background.
             painter.rect_filled(avail, 0.0, egui::Color32::from_gray(252));
 
-            let n = self.sorted_counts.len() as f32;
-            if n == 0.0 {
+            let n = self.sorted_counts.len();
+            if n == 0 {
                 return;
             }
-            let bar_w = (avail.width() / n).max(1.0);
+            let bar_w = (avail.width() / n as f32).max(1.0);
             let h = avail.height() - 16.0;
             let max = self.max_count.max(1) as f32;
-            for (i, &c) in self.sorted_counts.iter().enumerate() {
+
+            let response = ui.allocate_rect(avail, egui::Sense::hover());
+            let hover_pos = response.hover_pos();
+            let hovered_bar: Option<usize> = hover_pos.and_then(|hp| {
+                if !avail.contains(hp) {
+                    return None;
+                }
+                let idx = ((hp.x - avail.left()) / bar_w).floor() as i64;
+                if idx < 0 || idx as usize >= n {
+                    None
+                } else {
+                    Some(idx as usize)
+                }
+            });
+
+            for (i, &(c, _)) in self.sorted_counts.iter().enumerate() {
                 let x = avail.left() + (i as f32) * bar_w;
                 let bh = (c as f32 / max) * h;
                 let rect = egui::Rect::from_min_size(
                     egui::pos2(x, avail.bottom() - bh - 8.0),
                     egui::vec2(bar_w.max(1.0), bh),
                 );
-                painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(80, 130, 200));
+                let color = if Some(i) == hovered_bar {
+                    egui::Color32::from_rgb(220, 60, 60)
+                } else {
+                    egui::Color32::from_rgb(80, 130, 200)
+                };
+                painter.rect_filled(rect, 0.0, color);
             }
             painter.line_segment(
                 [
@@ -264,6 +290,20 @@ impl ViewerApp {
                 ],
                 egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
             );
+
+            if let Some(i) = hovered_bar {
+                let (count, orig_idx) = self.sorted_counts[i];
+                egui::show_tooltip_at_pointer(
+                    ctx,
+                    ui.layer_id(),
+                    egui::Id::new(("hist_tip", i)),
+                    |ui| {
+                        ui.label(format!("rank: {} / {}", i + 1, n));
+                        ui.label(format!("centroid #{orig_idx}"));
+                        ui.label(format!("vectors: {count}"));
+                    },
+                );
+            }
         });
     }
 }
