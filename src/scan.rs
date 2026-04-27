@@ -13,6 +13,9 @@ use crate::vpack::Slice;
 pub struct PerIndexStats {
     /// Sentinel (objectId, UINT64_MAX) present => index has trained data.
     pub trained: bool,
+    /// Raw value bytes at the sentinel key — VPack-serialized `TrainedData`
+    /// (`{codeData: <faiss serialized index bytes>}`). None if absent.
+    pub trained_value: Option<Vec<u8>>,
     /// listNumber -> number of document entries in that list.
     pub lists: BTreeMap<u64, u64>,
     /// Keys we could not classify (unexpected length, non-fatal).
@@ -109,12 +112,19 @@ fn make_cf_descriptors(cf_names: &[String]) -> Vec<ColumnFamilyDescriptor> {
         .collect()
 }
 
+/// Wraps an opened DB together with the temp directory used by RocksDB's
+/// secondary instance (if any). Field order matters: `db` is dropped first
+/// so the secondary closes its files before the temp dir is removed.
+struct OpenedDb {
+    db: DB,
+    _secondary_temp: Option<tempfile::TempDir>,
+}
+
 /// Opens the RocksDB instance. ArangoDB stores its WAL in a `journals/`
 /// subdirectory, so if that directory exists we open as a secondary instance
 /// (which tails the WAL) rather than plain read-only (which only sees flushed
-/// SST files). A temp directory is used for the secondary's own metadata and
-/// is cleaned up on drop.
-fn open_db(db_path: &str, cf_names: &[String]) -> Result<DB> {
+/// SST files).
+fn open_db(db_path: &str, cf_names: &[String]) -> Result<OpenedDb> {
     let journals = Path::new(db_path).join("journals");
     if journals.exists() {
         let secondary_path =
@@ -131,31 +141,37 @@ fn open_db(db_path: &str, cf_names: &[String]) -> Result<DB> {
         .with_context(|| format!("open_cf_descriptors_as_secondary on {}", db_path))?;
         db.try_catch_up_with_primary()
             .context("try_catch_up_with_primary failed")?;
-        // Keep tempdir alive until DB is dropped by leaking it; the OS will
-        // clean it up when the process exits.
-        std::mem::forget(secondary_path);
-        return Ok(db);
+        return Ok(OpenedDb {
+            db,
+            _secondary_temp: Some(secondary_path),
+        });
     }
 
     let mut db_opts = Options::default();
     db_opts.create_if_missing(false);
-    DB::open_cf_descriptors_read_only(&db_opts, db_path, make_cf_descriptors(cf_names), false)
-        .with_context(|| format!("open_cf_descriptors_read_only on {}", db_path))
+    let db =
+        DB::open_cf_descriptors_read_only(&db_opts, db_path, make_cf_descriptors(cf_names), false)
+            .with_context(|| format!("open_cf_descriptors_read_only on {}", db_path))?;
+    Ok(OpenedDb {
+        db,
+        _secondary_temp: None,
+    })
 }
 
 pub fn scan(db_path: &str) -> Result<ScanResult> {
     let cf_names = DB::list_cf(&Options::default(), db_path)
         .with_context(|| format!("list_cf on {}", db_path))?;
 
-    let db = open_db(db_path, &cf_names)?;
+    let opened = open_db(db_path, &cf_names)?;
+    let db = &opened.db;
 
-    let indexes = scan_vector_cf(&db)?;
+    let indexes = scan_vector_cf(db)?;
     let mut result = ScanResult {
         anomalies: indexes.values().map(|s| s.anomalies).sum(),
         indexes,
         metadata: HashMap::new(),
     };
-    result.metadata = scan_definitions_cf(&db).unwrap_or_else(|e| {
+    result.metadata = scan_definitions_cf(db).unwrap_or_else(|e| {
         eprintln!("warning: failed to scan definitions CF: {e:#}");
         HashMap::new()
     });
@@ -170,7 +186,7 @@ fn scan_vector_cf(db: &DB) -> Result<HashMap<u64, PerIndexStats>> {
     let mut by_id: HashMap<u64, PerIndexStats> = HashMap::new();
     let iter = db.iterator_cf(&cf, IteratorMode::Start);
     for item in iter {
-        let (key, _value) = item?;
+        let (key, value) = item?;
         if key.len() < 16 {
             // malformed — bucket under objectId 0 as an anomaly
             by_id.entry(0).or_default().anomalies += 1;
@@ -182,6 +198,7 @@ fn scan_vector_cf(db: &DB) -> Result<HashMap<u64, PerIndexStats>> {
 
         if list_number == u64::MAX {
             stats.trained = true;
+            stats.trained_value = Some(value.into_vec());
             continue;
         }
         match key.len() {

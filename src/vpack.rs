@@ -13,7 +13,6 @@ pub struct Slice<'a> {
     bytes: &'a [u8],
 }
 
-#[allow(dead_code)]
 impl<'a> Slice<'a> {
     pub fn new(bytes: &'a [u8]) -> Self {
         Slice { bytes }
@@ -23,25 +22,12 @@ impl<'a> Slice<'a> {
         self.bytes[0]
     }
 
-    pub fn raw(&self) -> &'a [u8] {
-        self.bytes
-    }
-
-    /// Total byte length of this VPack value, starting at byte 0.
-    pub fn value_len(&self) -> Result<usize> {
-        value_len(self.bytes)
-    }
-
     pub fn is_object(&self) -> bool {
         matches!(self.bytes[0], 0x0a..=0x12 | 0x14)
     }
 
     pub fn is_array(&self) -> bool {
         matches!(self.bytes[0], 0x01..=0x09 | 0x13)
-    }
-
-    pub fn is_string(&self) -> bool {
-        matches!(self.bytes[0], 0x40..=0xbf)
     }
 
     pub fn as_str(&self) -> Option<&'a str> {
@@ -57,6 +43,57 @@ impl<'a> Slice<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Extract a single uint8 (byte) value, accepting any integer encoding
+    /// VPack might use. ArangoDB serializes `vector<uint8_t>` as a VPack array
+    /// where elements are either smallint (0..9), 1-byte signed (0x20+v for
+    /// 0..127), or 1-byte unsigned (0x28+v).
+    pub fn as_byte(&self) -> Option<u8> {
+        let b = self.bytes;
+        match *b.first()? {
+            0x30..=0x39 => Some(b[0] - 0x30),
+            // signed int: width = type - 0x1f. Only treat as a byte if all
+            // upper bytes are zero and the result fits in u8.
+            t @ 0x20..=0x27 => {
+                let w = (t - 0x1f) as usize;
+                let bytes = b.get(1..1 + w)?;
+                let mut buf = [0u8; 8];
+                buf[..w].copy_from_slice(bytes);
+                let v = i64::from_le_bytes(buf);
+                // sign-extend: if the top bit of the highest byte is set, the
+                // value is negative — invalid for a byte.
+                if w < 8 && bytes[w - 1] & 0x80 != 0 {
+                    return None;
+                }
+                if (0..=255).contains(&v) { Some(v as u8) } else { None }
+            }
+            t @ 0x28..=0x2f => {
+                let w = (t - 0x27) as usize;
+                let bytes = b.get(1..1 + w)?;
+                let mut buf = [0u8; 8];
+                buf[..w].copy_from_slice(bytes);
+                let v = u64::from_le_bytes(buf);
+                if v <= 255 { Some(v as u8) } else { None }
+            }
+            _ => None,
+        }
+    }
+
+    /// VPack binary blob (types 0xc0..=0xc7). The width of the length field
+    /// is determined by `type - 0xbf`.
+    pub fn as_binary(&self) -> Option<&'a [u8]> {
+        let b = self.bytes;
+        let t = *b.first()?;
+        if !(0xc0..=0xc7).contains(&t) {
+            return None;
+        }
+        let w = (t - 0xbf) as usize;
+        let lenb = b.get(1..1 + w)?;
+        let mut buf = [0u8; 8];
+        buf[..w].copy_from_slice(lenb);
+        let n = u64::from_le_bytes(buf) as usize;
+        b.get(1 + w..1 + w + n)
     }
 
     pub fn as_u64(&self) -> Option<u64> {
@@ -85,71 +122,12 @@ impl<'a> Slice<'a> {
         None
     }
 
-    pub fn object_iter(&self) -> Result<ObjectIter<'a>> {
+    fn object_iter(&self) -> Result<ObjectIter<'a>> {
         ObjectIter::new(self.bytes)
     }
 
     pub fn array_iter(&self) -> Result<ArrayIter<'a>> {
         ArrayIter::new(self.bytes)
-    }
-
-    pub fn to_json(&self) -> String {
-        to_json_val(self.bytes)
-    }
-}
-
-// ---- JSON rendering (debug) ----------------------------------------------
-
-fn to_json_val(b: &[u8]) -> String {
-    if b.is_empty() {
-        return "null".into();
-    }
-    let s = Slice::new(b);
-    if s.is_object() {
-        let pairs: Vec<String> = s
-            .object_iter()
-            .map(|iter| {
-                iter.map(|(k, v)| {
-                    let key = k
-                        .as_str()
-                        .map(|s| format!("\"{}\"", s))
-                        .unwrap_or_else(|| "\"?\"".into());
-                    format!("{}:{}", key, to_json_val(v.raw()))
-                })
-                .collect()
-            })
-            .unwrap_or_default();
-        return format!("{{{}}}", pairs.join(","));
-    }
-    if s.is_array() {
-        let items: Vec<String> = s
-            .array_iter()
-            .map(|iter| iter.map(|v| to_json_val(v.raw())).collect())
-            .unwrap_or_default();
-        return format!("[{}]", items.join(","));
-    }
-    if s.is_string() {
-        return s
-            .as_str()
-            .map(|x| format!("\"{}\"", x))
-            .unwrap_or_else(|| "\"?\"".into());
-    }
-    if let Some(n) = s.as_u64() {
-        return n.to_string();
-    }
-    match b[0] {
-        0x19 => "false".into(),
-        0x1a => "true".into(),
-        0x18 => "null".into(),
-        0x1b => {
-            let f = f64::from_le_bytes(
-                b.get(1..9)
-                    .and_then(|x| x.try_into().ok())
-                    .unwrap_or([0; 8]),
-            );
-            f.to_string()
-        }
-        t => format!("\"<0x{:02x}>\"", t),
     }
 }
 

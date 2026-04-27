@@ -1,8 +1,9 @@
+mod centroids;
 mod scan;
 mod stats;
 mod vpack;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
@@ -28,6 +29,11 @@ struct Args {
     /// Output format.
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
+
+    /// If set, decode each trained index via FAISS and print centroid summary
+    /// (count, dim, first-row preview, norm range).
+    #[arg(long)]
+    centroids: bool,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -39,9 +45,42 @@ enum Format {
 fn main() -> Result<()> {
     let args = Args::parse();
     let result = scan::scan(&args.db)?;
+    if args.centroids {
+        print_centroids_info(&args, &result)?;
+    }
     match args.format {
         Format::Text => print_text(&args, &result),
         Format::Json => print_json(&args, &result)?,
+    }
+    Ok(())
+}
+
+fn print_centroids_info(args: &Args, r: &ScanResult) -> Result<()> {
+    for (oid, s) in filtered(args, r) {
+        let Some(value) = &s.trained_value else {
+            println!("index {oid}: no trained data");
+            continue;
+        };
+        let bytes = centroids::extract_code_data(value)
+            .with_context(|| format!("index {oid}: extracting codeData"))?;
+        let c = centroids::read_centroids(&bytes)
+            .with_context(|| format!("index {oid}: parsing FAISS index"))?;
+        let nlist = c.vectors.len();
+        let norms: Vec<f32> = c
+            .vectors
+            .iter()
+            .map(|v| v.iter().map(|x| x * x).sum::<f32>().sqrt())
+            .collect();
+        let nmin = norms.iter().cloned().fold(f32::INFINITY, f32::min);
+        let nmax = norms.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        println!(
+            "index {oid}: nlist={nlist}, dim={}, norm range=[{:.3}, {:.3}]",
+            c.dim, nmin, nmax
+        );
+        if let Some(first) = c.vectors.first() {
+            let preview: Vec<String> = first.iter().take(8).map(|x| format!("{x:.4}")).collect();
+            println!("  first centroid first 8 dims: [{}]", preview.join(", "));
+        }
     }
     Ok(())
 }
@@ -160,7 +199,7 @@ fn print_index(oid: u64, s: &PerIndexStats, meta: Option<&IndexMeta>) {
         if s.trained { "yes" } else { "no" }
     );
     println!("  total vectors:      {}", s.total_vectors());
-    println!("  non-empty centroids:{}", pad(s.non_empty_lists()));
+    println!("  non-empty centroids: {}", s.non_empty_lists());
     if let Some(max_list) = s.max_list_number() {
         println!("  max list# observed: {}", max_list);
     }
@@ -202,10 +241,6 @@ fn print_index(oid: u64, s: &PerIndexStats, meta: Option<&IndexMeta>) {
     for b in &dist.histogram {
         println!("      {:width$}  {:>10}", b.label, b.count, width = col);
     }
-}
-
-fn pad<T: std::fmt::Display>(v: T) -> String {
-    format!(" {}", v)
 }
 
 // ---- helpers -------------------------------------------------------------
