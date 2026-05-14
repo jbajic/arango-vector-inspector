@@ -115,8 +115,8 @@ fn make_cf_descriptors(cf_names: &[String]) -> Vec<ColumnFamilyDescriptor> {
 /// Wraps an opened DB together with the temp directory used by RocksDB's
 /// secondary instance (if any). Field order matters: `db` is dropped first
 /// so the secondary closes its files before the temp dir is removed.
-struct OpenedDb {
-    db: DB,
+pub(crate) struct OpenedDb {
+    pub(crate) db: DB,
     _secondary_temp: Option<tempfile::TempDir>,
 }
 
@@ -156,6 +156,14 @@ fn open_db(db_path: &str, cf_names: &[String]) -> Result<OpenedDb> {
         db,
         _secondary_temp: None,
     })
+}
+
+/// Open the DB in the same mode the scanner uses (secondary if journals/ present).
+/// Exported so other modules can reuse the DB for on-demand reads.
+pub(crate) fn open_for_reading(db_path: &str) -> Result<OpenedDb> {
+    let cf_names = DB::list_cf(&Options::default(), db_path)
+        .with_context(|| format!("list_cf on {}", db_path))?;
+    open_db(db_path, &cf_names)
 }
 
 pub fn scan(db_path: &str) -> Result<ScanResult> {

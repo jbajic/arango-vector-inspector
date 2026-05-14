@@ -1,6 +1,7 @@
 mod centroids;
 mod projection;
 mod scan;
+mod search;
 mod stats;
 mod ui;
 mod vpack;
@@ -155,6 +156,10 @@ fn build_index_view(
         bbox,
         max_count,
         sorted_counts,
+        db_path: args.db.clone(),
+        object_id: oid,
+        dim: c.dim,
+        metric: meta.and_then(|m| m.metric.clone()),
     })
 }
 

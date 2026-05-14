@@ -28,6 +28,14 @@ pub struct IndexView {
     pub max_count: u64,
     /// (count, original_centroid_index) sorted by count descending.
     pub sorted_counts: Vec<(u64, usize)>,
+    /// Path to the RocksDB data directory, used for on-demand vector reads.
+    pub db_path: String,
+    /// objectId of this index in the VectorIndex CF.
+    pub object_id: u64,
+    /// Vector dimension (from FAISS).
+    pub dim: usize,
+    /// Similarity metric as configured in the index ("l2", "cosine", "ip", …).
+    pub metric: Option<String>,
 }
 
 pub struct ViewerData {
@@ -58,6 +66,41 @@ enum Tab {
     Voronoi,
     Histogram,
     AreaCount,
+    Search,
+}
+
+struct SearchTabState {
+    query_text: String,
+    n_probe: usize,
+    top_k: usize,
+    error: Option<String>,
+    /// Metric resolved from the last successful search (drives display labels).
+    result_metric: crate::search::Metric,
+    closest_centroids: Vec<(usize, f32)>,
+    hits: Vec<HitState>,
+}
+
+struct HitState {
+    list_id: u64,
+    doc_id: u64,
+    /// Raw internal score (lower = better); use `Metric::display_value` for display.
+    score: f32,
+    vector: Vec<f32>,
+    expanded: bool,
+}
+
+impl Default for SearchTabState {
+    fn default() -> Self {
+        Self {
+            query_text: String::new(),
+            n_probe: 10,
+            top_k: 10,
+            error: None,
+            result_metric: crate::search::Metric::L2,
+            closest_centroids: Vec::new(),
+            hits: Vec::new(),
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -82,11 +125,15 @@ struct ViewerApp {
     voronoi_xform_ready: bool,
     /// Centroid currently picked by clicking on a cell.
     selected_cell: Option<usize>,
+    /// Per-index search state (query, results, expansion toggles).
+    search_states: Vec<SearchTabState>,
 }
 
 impl ViewerApp {
     fn new(data: ViewerData) -> Self {
+        let n = data.indexes.len();
         Self {
+            search_states: (0..n).map(|_| SearchTabState::default()).collect(),
             data,
             selected_idx: 0,
             tab: Tab::Overview,
@@ -131,6 +178,7 @@ impl eframe::App for ViewerApp {
                 ui.selectable_value(&mut self.tab, Tab::Voronoi, "Voronoi");
                 ui.selectable_value(&mut self.tab, Tab::Histogram, "Histogram");
                 ui.selectable_value(&mut self.tab, Tab::AreaCount, "Area vs Count");
+                ui.selectable_value(&mut self.tab, Tab::Search, "Search");
             });
         });
 
@@ -139,6 +187,7 @@ impl eframe::App for ViewerApp {
             Tab::Voronoi => self.render_voronoi(ctx),
             Tab::Histogram => self.render_histogram(ctx),
             Tab::AreaCount => self.render_area_count(ctx),
+            Tab::Search => self.render_search(ctx),
         }
     }
 }
@@ -511,6 +560,202 @@ impl ViewerApp {
                 );
             }
         });
+    }
+
+    fn render_search(&mut self, ctx: &egui::Context) {
+        let idx = self.selected_idx;
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let dim = self.data.indexes[idx].dim;
+            let n_centroids = self.data.indexes[idx].centroids.len();
+
+            ui.add_space(4.0);
+            ui.label(format!(
+                "Query vector  ({dim} floats, comma- or whitespace-separated):"
+            ));
+            ui.add(
+                egui::TextEdit::multiline(&mut self.search_states[idx].query_text)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("0.1, 0.2, 0.3, ..."),
+            );
+
+            ui.horizontal(|ui| {
+                ui.label("nProbe:");
+                ui.add(
+                    egui::DragValue::new(&mut self.search_states[idx].n_probe)
+                        .range(1..=n_centroids.max(1)),
+                );
+                ui.add_space(12.0);
+                ui.label("Top K:");
+                ui.add(
+                    egui::DragValue::new(&mut self.search_states[idx].top_k)
+                        .range(1..=10_000_usize),
+                );
+                ui.add_space(12.0);
+                if ui.button("  Search  ").clicked() {
+                    self.do_search(idx);
+                }
+            });
+
+            ui.separator();
+
+            // Show error or empty-state prompt before entering scroll area.
+            {
+                let state = &self.search_states[idx];
+                if let Some(err) = &state.error {
+                    ui.colored_label(egui::Color32::from_rgb(190, 30, 30), err);
+                    return;
+                }
+                if state.closest_centroids.is_empty() && state.hits.is_empty() {
+                    ui.label("Enter a query vector above and press Search.");
+                    return;
+                }
+            }
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                // --- Closest centroids ---
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Closest centroids (probed lists):").strong());
+                let metric = self.search_states[idx].result_metric;
+                let score_label = metric.score_label();
+                egui::Grid::new("cc_grid")
+                    .num_columns(2)
+                    .spacing([24.0, 2.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for &(ci, raw) in &self.search_states[idx].closest_centroids {
+                            ui.label(format!("#{ci}"));
+                            ui.label(format!(
+                                "{score_label} = {:.4}",
+                                metric.display_value(raw)
+                            ));
+                            ui.end_row();
+                        }
+                    });
+
+                ui.add_space(8.0);
+
+                // --- Top-K hits ---
+                let n = self.search_states[idx].hits.len();
+                if n == 0 {
+                    ui.label(
+                        egui::RichText::new(
+                            "No vectors found in those centroid lists. \
+                             The index may not yet have any indexed documents, \
+                             or the vector value format differs from expected \
+                             (raw little-endian f32).",
+                        )
+                        .italics(),
+                    );
+                    return;
+                }
+                ui.label(egui::RichText::new(format!("Top-{n} results:")).strong());
+
+                for hit_idx in 0..n {
+                    let expanded = self.search_states[idx].hits[hit_idx].expanded;
+                    let doc_id = self.search_states[idx].hits[hit_idx].doc_id;
+                    let list_id = self.search_states[idx].hits[hit_idx].list_id;
+                    let raw = self.search_states[idx].hits[hit_idx].score;
+                    let display_score = metric.display_value(raw);
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{:>3}.", hit_idx + 1)).monospace(),
+                        );
+                        ui.monospace(format!("0x{doc_id:016x}"));
+                        ui.label(format!("centroid #{list_id}"));
+                        ui.label(format!("{score_label} = {display_score:.4}"));
+                        let btn = if expanded { "▲ vector" } else { "▼ vector" };
+                        if ui.small_button(btn).clicked() {
+                            self.search_states[idx].hits[hit_idx].expanded = !expanded;
+                        }
+                    });
+
+                    if self.search_states[idx].hits[hit_idx].expanded {
+                        let vec_text: String = self.search_states[idx].hits[hit_idx]
+                            .vector
+                            .iter()
+                            .map(|f| format!("{f:.4}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        ui.indent(("vi", hit_idx), |ui| {
+                            egui::ScrollArea::horizontal()
+                                .id_source(("vs", hit_idx))
+                                .max_height(60.0)
+                                .show(ui, |ui| {
+                                    ui.monospace(&vec_text);
+                                });
+                        });
+                    }
+                    ui.separator();
+                }
+            });
+        });
+    }
+
+    /// Runs the IVF search synchronously and stores results in `search_states[idx]`.
+    fn do_search(&mut self, idx: usize) {
+        let dim = self.data.indexes[idx].dim;
+        let n_probe = self.search_states[idx].n_probe;
+        let top_k = self.search_states[idx].top_k;
+        let query_text = self.search_states[idx].query_text.clone();
+        let db_path = self.data.indexes[idx].db_path.clone();
+        let object_id = self.data.indexes[idx].object_id;
+        let metric = crate::search::Metric::from_str(
+            self.data.indexes[idx]
+                .metric
+                .as_deref()
+                .unwrap_or("l2"),
+        );
+
+        self.search_states[idx].error = None;
+        self.search_states[idx].closest_centroids.clear();
+        self.search_states[idx].hits.clear();
+
+        let query = match crate::search::parse_query_vector(&query_text) {
+            Err(e) => {
+                self.search_states[idx].error =
+                    Some(format!("Invalid query vector: {e}"));
+                return;
+            }
+            Ok(q) => q,
+        };
+
+        if dim > 0 && query.len() != dim {
+            self.search_states[idx].error = Some(format!(
+                "Query has {} elements, expected {dim}",
+                query.len()
+            ));
+            return;
+        }
+
+        let result = {
+            let centroids = &self.data.indexes[idx].high_dim;
+            crate::search::run_search(
+                &db_path, object_id, &query, centroids, n_probe, top_k, dim, metric,
+            )
+        };
+
+        match result {
+            Err(e) => {
+                self.search_states[idx].error = Some(format!("Search failed: {e:#}"));
+            }
+            Ok(sr) => {
+                self.search_states[idx].result_metric = sr.metric;
+                self.search_states[idx].closest_centroids = sr.closest_centroids;
+                self.search_states[idx].hits = sr
+                    .hits
+                    .into_iter()
+                    .map(|h| HitState {
+                        list_id: h.list_id,
+                        doc_id: h.doc_id,
+                        score: h.score,
+                        vector: h.vector,
+                        expanded: false,
+                    })
+                    .collect();
+            }
+        }
     }
 }
 
