@@ -1,14 +1,23 @@
-mod centroids;
-mod projection;
+mod proto;
 mod scan;
 mod search;
+mod source;
 mod stats;
-mod ui;
 mod vpack;
 
-use anyhow::{Context, Result};
+#[cfg(feature = "ui")]
+mod centroids;
+#[cfg(feature = "ui")]
+mod projection;
+#[cfg(feature = "ui")]
+mod ui;
+
+#[cfg(feature = "ui")]
+use anyhow::Context;
+use anyhow::Result;
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
+use std::sync::Arc;
 
 use crate::scan::{IndexMeta, PerIndexStats, ScanResult};
 use crate::stats::{Distribution, distribution};
@@ -21,9 +30,26 @@ use crate::stats::{Distribution, distribution};
 )]
 struct Args {
     /// Path to the RocksDB data directory (typically
-    /// <datadir>/engine-rocksdb). arangod must not be running.
+    /// <datadir>/engine-rocksdb). With --remote this path is on the remote
+    /// host. arangod may be running (opened as a secondary instance).
     #[arg(long)]
     db: String,
+
+    /// Read the DB on another machine over ssh: give the ssh destination
+    /// (e.g. user@gcp-host). The inspector binary must be installed there.
+    /// The UI still runs locally; only data crosses the wire.
+    #[arg(long)]
+    remote: Option<String>,
+
+    /// Path/name of the inspector binary on the remote host (used with
+    /// --remote). Defaults to looking it up on the remote PATH.
+    #[arg(long, default_value = "arango-vector-inspector")]
+    remote_bin: String,
+
+    /// Internal: act as the remote reader end of a --remote connection,
+    /// answering framed requests on stdin/stdout. Not for interactive use.
+    #[arg(long, hide = true)]
+    serve: bool,
 
     /// Limit output to a single index by objectId (decimal).
     #[arg(long)]
@@ -64,13 +90,29 @@ enum Format {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let result = scan::scan(&args.db)?;
+
+    // Remote reader end: speak the framed protocol on stdin/stdout and exit.
+    if args.serve {
+        return source::run_serve(&args.db);
+    }
+
+    let source: Arc<dyn source::DataSource> = match &args.remote {
+        Some(host) => Arc::new(source::RemoteSource::spawn(
+            host,
+            &args.db,
+            &args.remote_bin,
+        )?),
+        None => Arc::new(source::LocalSource::open(&args.db)?),
+    };
+    let result = source.scan()?;
+
     if args.ui {
-        return run_ui(&args, &result);
+        return run_ui(&args, &result, source);
     }
     if args.centroids {
         print_centroids_info(&args, &result)?;
     }
+
     match args.format {
         Format::Text => print_text(&args, &result),
         Format::Json => print_json(&args, &result)?,
@@ -78,7 +120,22 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_ui(args: &Args, r: &ScanResult) -> Result<()> {
+#[cfg(not(feature = "ui"))]
+fn run_ui(_: &Args, _: &ScanResult, _: Arc<dyn source::DataSource>) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "this build has no UI support — rebuild with default features (the `ui` feature)"
+    ))
+}
+
+#[cfg(not(feature = "ui"))]
+fn print_centroids_info(_: &Args, _: &ScanResult) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "--centroids requires the `ui` feature (FAISS decode not compiled in)"
+    ))
+}
+
+#[cfg(feature = "ui")]
+fn run_ui(args: &Args, r: &ScanResult, source: Arc<dyn source::DataSource>) -> Result<()> {
     let candidates: Vec<(u64, &PerIndexStats)> = filtered(args, r)
         .filter(|(_, s)| s.trained_value.is_some())
         .collect();
@@ -101,9 +158,13 @@ fn run_ui(args: &Args, r: &ScanResult) -> Result<()> {
         views.push(view);
     }
 
-    ui::run(ui::ViewerData { indexes: views })
+    ui::run(ui::ViewerData {
+        indexes: views,
+        source,
+    })
 }
 
+#[cfg(feature = "ui")]
 fn build_index_view(
     oid: u64,
     stats: &PerIndexStats,
@@ -156,13 +217,13 @@ fn build_index_view(
         bbox,
         max_count,
         sorted_counts,
-        db_path: args.db.clone(),
         object_id: oid,
         dim: c.dim,
         metric: meta.and_then(|m| m.metric.clone()),
     })
 }
 
+#[cfg(feature = "ui")]
 fn build_overview_kvs(
     oid: u64,
     s: &PerIndexStats,
@@ -209,6 +270,7 @@ fn build_overview_kvs(
     kvs
 }
 
+#[cfg(feature = "ui")]
 fn print_centroids_info(args: &Args, r: &ScanResult) -> Result<()> {
     for (oid, s) in filtered(args, r) {
         let Some(value) = &s.trained_value else {

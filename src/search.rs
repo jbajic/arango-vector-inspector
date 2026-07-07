@@ -11,12 +11,14 @@
 //!     stored vector, then returning the top-K results.
 
 use anyhow::{Context, Result, anyhow};
-use rocksdb::IteratorMode;
+use rocksdb::{DB, IteratorMode};
 
 // ---- Metric -----------------------------------------------------------------
 
 /// Distance / similarity metric.  Drives how scores are computed and which
-/// direction "better" means.
+/// direction "better" means. Client-side only: the serve process ships raw
+/// vectors and never scores.
+#[cfg(feature = "ui")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Metric {
     /// Euclidean L2 distance — smaller is better.
@@ -27,6 +29,7 @@ pub enum Metric {
     Ip,
 }
 
+#[cfg(feature = "ui")]
 impl Metric {
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().trim() {
@@ -44,13 +47,6 @@ impl Metric {
         }
     }
 
-    /// True when results should be presented in ascending score order.
-    /// (L2: ascending distance; cosine/IP: descending similarity, i.e. the
-    /// internal score is negated so the sort is still ascending.)
-    pub fn ascending(self) -> bool {
-        true // internal scores are always "lower = better"
-    }
-
     /// Compute the internal score between `a` and `b`.
     /// Always returns a value where **lower means more similar**, regardless
     /// of metric:
@@ -59,7 +55,12 @@ impl Metric {
     ///   IP      → −dot_product
     pub fn raw_score(self, a: &[f32], b: &[f32]) -> f32 {
         match self {
-            Self::L2 => a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f32>().sqrt(),
+            Self::L2 => a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).powi(2))
+                .sum::<f32>()
+                .sqrt(),
             Self::Cosine | Self::Ip => -a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>(),
         }
     }
@@ -76,6 +77,7 @@ impl Metric {
 
 // ---- Public types -----------------------------------------------------------
 
+#[cfg(feature = "ui")]
 pub struct SearchHit {
     pub list_id: u64,
     pub doc_id: u64,
@@ -85,19 +87,12 @@ pub struct SearchHit {
     pub vector: Vec<f32>,
 }
 
-pub struct SearchResult {
-    pub metric: Metric,
-    /// `(centroid_index, raw_score)` sorted best-first.
-    pub closest_centroids: Vec<(usize, f32)>,
-    /// Top-K document hits sorted best-first.
-    pub hits: Vec<SearchHit>,
-}
-
 // ---- Parse ------------------------------------------------------------------
 
 /// Parse a float array string into `Vec<f32>`.
 /// Accepts plain comma/whitespace-separated values as well as JSON-style
 /// `[0.1, 0.2, ...]` notation — square brackets are stripped.
+#[cfg(feature = "ui")]
 pub fn parse_query_vector(text: &str) -> Result<Vec<f32>> {
     let stripped = text.trim().trim_start_matches('[').trim_end_matches(']');
     stripped
@@ -116,6 +111,7 @@ pub fn parse_query_vector(text: &str) -> Result<Vec<f32>> {
 
 /// Find the `n_probe` centroid lists that are most relevant to `query`.
 /// Sorted best-first (lowest raw score = most similar).
+#[cfg(feature = "ui")]
 pub fn find_closest_centroids(
     query: &[f32],
     centroids: &[Vec<f32>],
@@ -127,66 +123,53 @@ pub fn find_closest_centroids(
         .enumerate()
         .map(|(i, c)| (i, metric.raw_score(query, c)))
         .collect();
-    scores.sort_unstable_by(|a, b| {
-        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    scores.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     scores.truncate(n_probe);
     scores
 }
 
-/// Full IVF search: probe `n_probe` centroid lists and return the `top_k`
-/// best-matching document vectors.
-pub fn run_search(
-    db_path: &str,
-    object_id: u64,
+/// Score `raw` document vectors against `query` and return the `top_k` best
+/// hits (lowest raw score first). Pure — the DB read happens elsewhere.
+#[cfg(feature = "ui")]
+pub fn rank_hits(
     query: &[f32],
-    centroids: &[Vec<f32>],
-    n_probe: usize,
+    raw: Vec<(u64, u64, Vec<f32>)>,
     top_k: usize,
-    dim: usize,
     metric: Metric,
-) -> Result<SearchResult> {
-    let closest = find_closest_centroids(query, centroids, n_probe, metric);
-
-    if dim == 0 || closest.is_empty() {
-        return Ok(SearchResult { metric, closest_centroids: closest, hits: Vec::new() });
-    }
-
-    let list_ids: Vec<u64> = closest.iter().map(|(i, _)| *i as u64).collect();
-    let raw = read_vectors_for_lists(db_path, object_id, &list_ids, dim)
-        .context("reading vectors from VectorIndex CF")?;
-
+) -> Vec<SearchHit> {
     let mut hits: Vec<SearchHit> = raw
         .into_iter()
         .map(|(list_id, doc_id, vector)| {
             let score = metric.raw_score(query, &vector);
-            SearchHit { list_id, doc_id, score, vector }
+            SearchHit {
+                list_id,
+                doc_id,
+                score,
+                vector,
+            }
         })
         .collect();
 
     hits.sort_unstable_by(|a, b| {
-        a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal)
+        a.score
+            .partial_cmp(&b.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     hits.truncate(top_k);
-
-    Ok(SearchResult { metric, closest_centroids: closest, hits })
+    hits
 }
 
 // ---- DB read ----------------------------------------------------------------
 
-/// Read all document vectors stored in the given centroid lists.
-/// Returns `(list_id, doc_id, vector)` for each entry whose value length
-/// matches `dim * 4` bytes (raw f32 little-endian).
-fn read_vectors_for_lists(
-    db_path: &str,
+/// Read all document vectors stored in the given centroid lists of an already
+/// open DB. Returns `(list_id, doc_id, vector)` for each entry whose value
+/// length matches `dim * 4` bytes (raw f32 little-endian).
+pub(crate) fn read_vectors_open(
+    db: &DB,
     object_id: u64,
     list_ids: &[u64],
     dim: usize,
 ) -> Result<Vec<(u64, u64, Vec<f32>)>> {
-    let opened = crate::scan::open_for_reading(db_path)
-        .context("opening DB for vector read")?;
-    let db = &opened.db;
-
     let cf = db
         .cf_handle("VectorIndex")
         .ok_or_else(|| anyhow!("VectorIndex CF not found"))?;

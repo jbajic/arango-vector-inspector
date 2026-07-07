@@ -18,6 +18,7 @@ impl<'a> Slice<'a> {
         Slice { bytes }
     }
 
+    #[cfg(feature = "ui")]
     pub fn type_byte(&self) -> u8 {
         self.bytes[0]
     }
@@ -49,6 +50,7 @@ impl<'a> Slice<'a> {
     /// VPack might use. ArangoDB serializes `vector<uint8_t>` as a VPack array
     /// where elements are either smallint (0..9), 1-byte signed (0x20+v for
     /// 0..127), or 1-byte unsigned (0x28+v).
+    #[cfg(feature = "ui")]
     pub fn as_byte(&self) -> Option<u8> {
         let b = self.bytes;
         match *b.first()? {
@@ -86,6 +88,7 @@ impl<'a> Slice<'a> {
 
     /// VPack binary blob (types 0xc0..=0xc7). The width of the length field
     /// is determined by `type - 0xbf`.
+    #[cfg(feature = "ui")]
     pub fn as_binary(&self) -> Option<&'a [u8]> {
         let b = self.bytes;
         let t = *b.first()?;

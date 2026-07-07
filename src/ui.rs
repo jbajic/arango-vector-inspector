@@ -4,10 +4,12 @@
 
 use anyhow::Result;
 use eframe::egui;
+use std::sync::Arc;
 use voronator::VoronoiDiagram;
 use voronator::delaunator::Point;
 
 use crate::projection::Point2;
+use crate::source::DataSource;
 
 pub struct CentroidView {
     pub point: Point2,
@@ -28,8 +30,6 @@ pub struct IndexView {
     pub max_count: u64,
     /// (count, original_centroid_index) sorted by count descending.
     pub sorted_counts: Vec<(u64, usize)>,
-    /// Path to the RocksDB data directory, used for on-demand vector reads.
-    pub db_path: String,
     /// objectId of this index in the VectorIndex CF.
     pub object_id: u64,
     /// Vector dimension (from FAISS).
@@ -40,6 +40,8 @@ pub struct IndexView {
 
 pub struct ViewerData {
     pub indexes: Vec<IndexView>,
+    /// Backing store for on-demand vector reads (local DB or remote over ssh).
+    pub source: Arc<dyn DataSource>,
 }
 
 pub fn run(data: ViewerData) -> Result<()> {
@@ -625,10 +627,7 @@ impl ViewerApp {
                     .show(ui, |ui| {
                         for &(ci, raw) in &self.search_states[idx].closest_centroids {
                             ui.label(format!("#{ci}"));
-                            ui.label(format!(
-                                "{score_label} = {:.4}",
-                                metric.display_value(raw)
-                            ));
+                            ui.label(format!("{score_label} = {:.4}", metric.display_value(raw)));
                             ui.end_row();
                         }
                     });
@@ -659,9 +658,7 @@ impl ViewerApp {
                     let display_score = metric.display_value(raw);
 
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{:>3}.", hit_idx + 1)).monospace(),
-                        );
+                        ui.label(egui::RichText::new(format!("{:>3}.", hit_idx + 1)).monospace());
                         ui.monospace(format!("0x{doc_id:016x}"));
                         ui.label(format!("centroid #{list_id}"));
                         ui.label(format!("{score_label} = {display_score:.4}"));
@@ -699,13 +696,9 @@ impl ViewerApp {
         let n_probe = self.search_states[idx].n_probe;
         let top_k = self.search_states[idx].top_k;
         let query_text = self.search_states[idx].query_text.clone();
-        let db_path = self.data.indexes[idx].db_path.clone();
         let object_id = self.data.indexes[idx].object_id;
         let metric = crate::search::Metric::from_str(
-            self.data.indexes[idx]
-                .metric
-                .as_deref()
-                .unwrap_or("l2"),
+            self.data.indexes[idx].metric.as_deref().unwrap_or("l2"),
         );
 
         self.search_states[idx].error = None;
@@ -714,8 +707,7 @@ impl ViewerApp {
 
         let query = match crate::search::parse_query_vector(&query_text) {
             Err(e) => {
-                self.search_states[idx].error =
-                    Some(format!("Invalid query vector: {e}"));
+                self.search_states[idx].error = Some(format!("Invalid query vector: {e}"));
                 return;
             }
             Ok(q) => q,
@@ -729,33 +721,42 @@ impl ViewerApp {
             return;
         }
 
-        let result = {
+        // Phase 1 (local, pure): pick the nProbe nearest centroid lists.
+        let closest = {
             let centroids = &self.data.indexes[idx].high_dim;
-            crate::search::run_search(
-                &db_path, object_id, &query, centroids, n_probe, top_k, dim, metric,
-            )
+            crate::search::find_closest_centroids(&query, centroids, n_probe, metric)
+        };
+        let list_ids: Vec<u64> = closest.iter().map(|(i, _)| *i as u64).collect();
+
+        // Phase 2 (may be remote): read the vectors in those lists, then score.
+        let hits = if dim == 0 || list_ids.is_empty() {
+            Vec::new()
+        } else {
+            match self
+                .data
+                .source
+                .read_vectors_for_lists(object_id, &list_ids, dim)
+            {
+                Err(e) => {
+                    self.search_states[idx].error = Some(format!("Search failed: {e:#}"));
+                    return;
+                }
+                Ok(raw) => crate::search::rank_hits(&query, raw, top_k, metric),
+            }
         };
 
-        match result {
-            Err(e) => {
-                self.search_states[idx].error = Some(format!("Search failed: {e:#}"));
-            }
-            Ok(sr) => {
-                self.search_states[idx].result_metric = sr.metric;
-                self.search_states[idx].closest_centroids = sr.closest_centroids;
-                self.search_states[idx].hits = sr
-                    .hits
-                    .into_iter()
-                    .map(|h| HitState {
-                        list_id: h.list_id,
-                        doc_id: h.doc_id,
-                        score: h.score,
-                        vector: h.vector,
-                        expanded: false,
-                    })
-                    .collect();
-            }
-        }
+        self.search_states[idx].result_metric = metric;
+        self.search_states[idx].closest_centroids = closest;
+        self.search_states[idx].hits = hits
+            .into_iter()
+            .map(|h| HitState {
+                list_id: h.list_id,
+                doc_id: h.doc_id,
+                score: h.score,
+                vector: h.vector,
+                expanded: false,
+            })
+            .collect();
     }
 }
 

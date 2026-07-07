@@ -3,13 +3,14 @@
 
 use anyhow::{Context, Result, anyhow};
 use rocksdb::{ColumnFamilyDescriptor, DB, IteratorMode, Options};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use crate::vpack::Slice;
 
 /// Per-vector-index accumulated stats from the VectorIndex CF scan.
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Serialize, Deserialize)]
 pub struct PerIndexStats {
     /// Sentinel (objectId, UINT64_MAX) present => index has trained data.
     pub trained: bool,
@@ -37,7 +38,7 @@ impl PerIndexStats {
 
 /// NLists parameter — either a fixed count or a tiered-sqrt scaling spec.
 /// Mirrors `NListsParameter` in ArangoDB's VectorIndexDefinition.h.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NListsParam {
     Fixed(u64),
     /// autoSqrt: nLists = max(min_n_lists, multiplier * sqrt(doc_count)),
@@ -76,7 +77,7 @@ impl NListsParam {
 }
 
 /// Index metadata recovered from the definitions CF.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct IndexMeta {
     pub object_id: u64,
@@ -88,6 +89,7 @@ pub struct IndexMeta {
     pub n_lists: Option<NListsParam>,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct ScanResult {
     pub indexes: HashMap<u64, PerIndexStats>,
     pub metadata: HashMap<u64, IndexMeta>,
@@ -117,7 +119,23 @@ fn make_cf_descriptors(cf_names: &[String]) -> Vec<ColumnFamilyDescriptor> {
 /// so the secondary closes its files before the temp dir is removed.
 pub(crate) struct OpenedDb {
     pub(crate) db: DB,
+    is_secondary: bool,
     _secondary_temp: Option<tempfile::TempDir>,
+}
+
+impl OpenedDb {
+    /// For a secondary instance, replay any WAL the primary has written since
+    /// the last catch-up so subsequent reads see fresh (unflushed) data. A
+    /// plain read-only instance is already at a fixed snapshot, so this is a
+    /// no-op there.
+    pub(crate) fn catch_up(&self) -> Result<()> {
+        if self.is_secondary {
+            self.db
+                .try_catch_up_with_primary()
+                .context("try_catch_up_with_primary failed")?;
+        }
+        Ok(())
+    }
 }
 
 /// Opens the RocksDB instance. ArangoDB stores its WAL in a `journals/`
@@ -143,6 +161,7 @@ fn open_db(db_path: &str, cf_names: &[String]) -> Result<OpenedDb> {
             .context("try_catch_up_with_primary failed")?;
         return Ok(OpenedDb {
             db,
+            is_secondary: true,
             _secondary_temp: Some(secondary_path),
         });
     }
@@ -154,6 +173,7 @@ fn open_db(db_path: &str, cf_names: &[String]) -> Result<OpenedDb> {
             .with_context(|| format!("open_cf_descriptors_read_only on {}", db_path))?;
     Ok(OpenedDb {
         db,
+        is_secondary: false,
         _secondary_temp: None,
     })
 }
@@ -166,13 +186,8 @@ pub(crate) fn open_for_reading(db_path: &str) -> Result<OpenedDb> {
     open_db(db_path, &cf_names)
 }
 
-pub fn scan(db_path: &str) -> Result<ScanResult> {
-    let cf_names = DB::list_cf(&Options::default(), db_path)
-        .with_context(|| format!("list_cf on {}", db_path))?;
-
-    let opened = open_db(db_path, &cf_names)?;
-    let db = &opened.db;
-
+/// Scan the VectorIndex and definitions column families of an already-open DB.
+pub(crate) fn scan_open(db: &DB) -> Result<ScanResult> {
     let indexes = scan_vector_cf(db)?;
     let mut result = ScanResult {
         anomalies: indexes.values().map(|s| s.anomalies).sum(),

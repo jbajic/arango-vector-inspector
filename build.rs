@@ -2,6 +2,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    // FAISS is only needed by the `ui` feature (centroid decode). A serve-only
+    // build (`--no-default-features --features serve`) links neither FAISS nor
+    // the GUI, so it builds trivially on a headless box.
+    if std::env::var_os("CARGO_FEATURE_UI").is_none() {
+        return;
+    }
+
     let manifest_dir =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let faiss_src = manifest_dir.join("third_party").join("faiss");
@@ -27,7 +35,6 @@ fn main() {
         }
     }
 
-    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-link-search=native={}", faiss_c.display());
     println!("cargo:rustc-link-search=native={}", faiss.display());
     // Embed rpath so the binary finds libfaiss_c.so / libfaiss.so without

@@ -13,12 +13,21 @@ rocksdb = { version = "0.22", default-features = false, features = ["snappy", "l
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-faiss = "0.13"
-faiss-sys = "0.7"
-nalgebra = "0.33"
-voronator = "0.2"
-bhtsne = { version = "0.5", default-features = false }
-eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow"] }
+bincode = "1.3"
+faiss = { version = "0.13", optional = true }
+faiss-sys = { version = "0.7", optional = true }
+nalgebra = { version = "0.33", optional = true }
+voronator = { version = "0.2", optional = true }
+bhtsne = { version = "0.5", default-features = false, optional = true }
+eframe = { version = "0.28", default-features = false, features = ["default_fonts", "glow"], optional = true }
+
+[features]
+default = ["ui"]
+# Full local UI: pulls in the GUI, FAISS decode, and 2D projection stack.
+ui = ["dep:eframe", "dep:faiss", "dep:faiss-sys", "dep:nalgebra", "dep:voronator", "dep:bhtsne"]
+# Headless remote reader: RocksDB + serde only, no GUI/FAISS. Build with
+#   cargo build --release --no-default-features --features serve
+serve = []
 
 [profile.release]
 lto = "thin"
